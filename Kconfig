@@ -55,6 +55,15 @@ config ESP32_UDP_LOGGER_ENABLE_MDNS
     default y
     depends on ESP32_UDP_LOGGER_ENABLED
 
+config ESP32_UDP_LOGGER_AUTOSTART_INIT_NETIF
+    bool "Call esp_netif_init() in esp32_udp_logger_autostart()"
+    default y
+    depends on ESP32_UDP_LOGGER_ENABLED
+    help
+        Disable this when your application already initializes networking
+        (for example, components that bring up ESP-NETIF/LwIP before
+        esp32-udp-logger is started).
+
 config ESP32_UDP_LOGGER_SERVICE
     bool "Advertise mDNS service _esp32udplog._udp"
     default y
