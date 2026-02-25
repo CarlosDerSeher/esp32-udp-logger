@@ -27,6 +27,10 @@ Once the ESP32 gets an IP (Wi‑Fi STA or Ethernet):
 You can change these via `menuconfig`:
 `Component config → esp32-udp-logger`.
 
+For apps that already initialize networking, you can disable internal netif init:
+`Component config → esp32-udp-logger → Call esp_netif_init() in esp32_udp_logger_autostart()`.
+
+
 ---
 
 # Quick start (single device)
@@ -210,6 +214,14 @@ echo "bind 192.168.1.10 9999" | nc -u -w1 esp32-udp-logger-7A3F.local 9998
   ```bash
   python tools/esp32_udp_logger_cli.py listen
   ```
+
+## Crash/assert around socket creation (Invalid mbox)
+If your app already sets up networking/LwIP, disable:
+`Component config → esp32-udp-logger → Call esp_netif_init() in esp32_udp_logger_autostart()`.
+
+Also ensure LwIP allows enough UDP sockets for your app + logger. This component uses two UDP sockets (TX + RX), so increase:
+`Component config → LWIP → UDP → The maximum number of active UDP "connections"` (for example 2 or more).
+
 
 ## `list` shows no devices
 mDNS can be blocked:

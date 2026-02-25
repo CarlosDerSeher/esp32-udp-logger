@@ -445,8 +445,10 @@ void esp32_udp_logger_autostart(void)
 
   esp_err_t e;
 
+#if CONFIG_ESP32_UDP_LOGGER_AUTOSTART_INIT_NETIF
   e = esp_netif_init();
   if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return;
+#endif
 
   e = esp_event_loop_create_default();
   if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return;
