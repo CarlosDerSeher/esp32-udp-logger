@@ -25,10 +25,6 @@
 
 #include "sdkconfig.h"
 
-#ifndef CONFIG_ESP32_UDP_LOGGER_ENABLED
-#define CONFIG_ESP32_UDP_LOGGER_ENABLED 1
-#endif
-
 #if CONFIG_ESP32_UDP_LOGGER_ENABLED
 
 typedef struct {
