@@ -1,3 +1,5 @@
+#include "sdkconfig.h"
+
 #include "esp32_udp_logger.h"
 
 #include <string.h>
@@ -23,7 +25,7 @@
 #include "mdns.h"
 #endif
 
-#include "sdkconfig.h"
+
 
 #if CONFIG_ESP32_UDP_LOGGER_ENABLED
 
