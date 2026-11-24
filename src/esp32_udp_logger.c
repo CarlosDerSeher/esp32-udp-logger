@@ -40,6 +40,14 @@ typedef enum {
 } dest_mode_t;
 
 static SemaphoreHandle_t s_lock;
+/*
+ * Line buffers: a fixed pool, allocated once. s_free_q holds the free ones,
+ * s_q the filled ones waiting for tx_task; both queues hold pointers only.
+ * The vprintf hook formats straight into a pool buffer, so a task that logs
+ * needs no line buffer on its own stack.
+ */
+static log_item_t *s_pool;
+static QueueHandle_t s_free_q;
 static QueueHandle_t s_q;
 static TaskHandle_t s_tx_task;
 static TaskHandle_t s_rx_task;
@@ -180,24 +188,20 @@ static void update_broadcast_dest(void)
 
 static void start_hook_if_needed(void);
 
-static void queue_line(const char *data, size_t len)
+/* Take a free line buffer, or NULL (counted as a drop) */
+static log_item_t *take_item(void)
 {
-  if (!data || len == 0 || !s_q) return;
-
-  log_item_t item;
-  size_t n = len;
-  if (n > sizeof(item.data)) n = sizeof(item.data);
-
-  memcpy(item.data, data, n);
-  item.len = (uint16_t)n;
-
+  log_item_t *item = NULL;
+  if (!s_free_q) return NULL;
 #if CONFIG_ESP32_UDP_LOGGER_DROP_ON_FULL
-  if (xQueueSend(s_q, &item, 0) != pdTRUE) {
+  if (xQueueReceive(s_free_q, &item, 0) != pdTRUE) {
     s_drop_count++;
+    return NULL;
   }
 #else
-  (void)xQueueSend(s_q, &item, portMAX_DELAY);
+  (void)xQueueReceive(s_free_q, &item, portMAX_DELAY);
 #endif
+  return item;
 }
 
 static int udp_vprintf(const char *fmt, va_list ap)
@@ -212,29 +216,26 @@ static int udp_vprintf(const char *fmt, va_list ap)
 
   if (!s_started) return n1;
 
-  char tmp[CONFIG_ESP32_UDP_LOGGER_MAX_LINE];
+  log_item_t *item = take_item();
+  if (!item) return n1;
 
+  const size_t cap = sizeof(item->data);
+  int p = 0;
 #if CONFIG_ESP32_UDP_LOGGER_PREFIX_DEVICE
   if (s_hostname[0] == 0) make_hostname_once();
-  int p = snprintf(tmp, sizeof(tmp), "[%s] ", s_hostname[0] ? s_hostname : "esp32-udp-logger");
-  if (p < 0 || p >= (int)sizeof(tmp)) return n1;
-
-  int n = vsnprintf(tmp + p, sizeof(tmp) - (size_t)p, fmt, ap);
-  if (n <= 0) return n1;
-
-  size_t to_send = (size_t)p + (size_t)n;
-  if (to_send >= sizeof(tmp)) to_send = sizeof(tmp) - 1;
-
-  queue_line(tmp, to_send);
-#else
-  int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
-  if (n <= 0) return n1;
-
-  size_t to_send = (size_t)n;
-  if (to_send >= sizeof(tmp)) to_send = sizeof(tmp) - 1;
-
-  queue_line(tmp, to_send);
+  p = snprintf(item->data, cap, "[%s] ", s_hostname[0] ? s_hostname : "esp32-udp-logger");
+  if (p < 0 || p >= (int)cap) p = 0;
 #endif
+  int n = vsnprintf(item->data + p, cap - (size_t)p, fmt, ap);
+  if (n <= 0) {
+    (void)xQueueSend(s_free_q, &item, 0);  // nothing to send, give it back
+    return n1;
+  }
+
+  size_t len = (size_t)p + (size_t)n;
+  if (len >= cap) len = cap - 1;  // truncated by vsnprintf
+  item->len = (uint16_t)len;
+  (void)xQueueSend(s_q, &item, 0);  // never full: holds at most all buffers
 
   return n1;
 }
@@ -272,7 +273,7 @@ static void rx_reply(const char *msg, const struct sockaddr *to, socklen_t tolen
 static void tx_task(void *arg)
 {
   (void)arg;
-  log_item_t item;
+  log_item_t *item;
 
   for (;;) {
     if (xQueueReceive(s_q, &item, portMAX_DELAY) != pdTRUE) continue;
@@ -286,17 +287,18 @@ static void tx_task(void *arg)
     struct sockaddr_in udest = s_unicast;
     lock_give();
 
-    if (sock < 0) continue;
-
-    if (mode == DEST_UNICAST && u_ok) {
-      (void)sendto(sock, item.data, item.len, 0,
-                   (struct sockaddr *)&udest, sizeof(udest));
-    } else if (bcast_ok) {
-      int yes = 1;
-      (void)setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
-      (void)sendto(sock, item.data, item.len, 0,
-                   (struct sockaddr *)&bdest, sizeof(bdest));
+    if (sock >= 0) {
+      if (mode == DEST_UNICAST && u_ok) {
+        (void)sendto(sock, item->data, item->len, 0,
+                     (struct sockaddr *)&udest, sizeof(udest));
+      } else if (bcast_ok) {
+        int yes = 1;
+        (void)setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+        (void)sendto(sock, item->data, item->len, 0,
+                     (struct sockaddr *)&bdest, sizeof(bdest));
+      }
     }
+    (void)xQueueSend(s_free_q, &item, portMAX_DELAY);  // back to the pool
   }
 }
 
@@ -463,8 +465,25 @@ void esp32_udp_logger_autostart(void)
   if (!s_lock) s_lock = xSemaphoreCreateMutex();
   if (!s_lock) return;
 
-  if (!s_q) s_q = xQueueCreate(CONFIG_ESP32_UDP_LOGGER_QUEUE_DEPTH, sizeof(log_item_t));
-  if (!s_q) return;
+  if (!s_pool) {
+    const int depth = CONFIG_ESP32_UDP_LOGGER_QUEUE_DEPTH;
+    log_item_t *pool = calloc(depth, sizeof(log_item_t));
+    QueueHandle_t free_q = xQueueCreate(depth, sizeof(log_item_t *));
+    QueueHandle_t q = xQueueCreate(depth, sizeof(log_item_t *));
+    if (!pool || !free_q || !q) {
+      free(pool);
+      if (free_q) vQueueDelete(free_q);
+      if (q) vQueueDelete(q);
+      return;
+    }
+    for (int i = 0; i < depth; i++) {
+      log_item_t *item = &pool[i];
+      (void)xQueueSend(free_q, &item, 0);
+    }
+    s_free_q = free_q;
+    s_q = q;
+    s_pool = pool;
+  }
 
   make_hostname_once();
 
